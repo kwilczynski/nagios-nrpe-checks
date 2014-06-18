@@ -17,10 +17,14 @@
 # feasible cure to this behaviour ...
 #
 
+require 'timeout'
 require 'getoptlong'
 
 # Location of the host utility ...
 HOST_BINARY = '/usr/bin/host'
+
+# Default timeout ...
+TIMEOUT = 60 # A minute for DNS resolution would be VERY long.
 
 # Default exit codes ...
 EXIT_SUCCESS = 0
@@ -39,15 +43,22 @@ Check whether a domain name resolution is functioning correctly for a given host
 
 Usage:
 
-  #{$0} --host-name <HOST NAME> [--host-binary <BINARY>] [--help]
+  #{$0} --host-name <HOST NAME> [--server <HOST>] [--host-binary <BINARY>]
+  #{$0} --host-name <HOST NAME> [--timeout <SECONDS>] [--help]
 
   Options:
 
     --host-name    -h  Required.  Specify the host name to use when attempting
                                   resolution of the domain name into an IP address.
 
+    --server       -s  Optional.  Specify the resolver to use to make the query against.
+                                  By default local resolver will be used.
+
     --host-binary  -b  Optional.  Specify the location of the host utility binary to use.
                                   Defaults to #{HOST_BINARY}.
+
+    --timeout      -t  Optional.  Specify how long to wait (seconds) before assuming that
+                                  the execution has timed out.  Defaults to #{TIMEOUT} seconds.
 
     --help         -?  This help screen.
 
@@ -66,8 +77,14 @@ if $0 == __FILE__
   STDOUT.sync = true
   STDERR.sync = true
 
+  # A resolver to use. By default nothing.
+  server = ''
+
   # Setting our default values ...
   host_binary = HOST_BINARY
+
+  # Setting our default timeout ...
+  timeout = TIMEOUT
 
   # A host name for which we attempt to resolve an IP address ...
   host_name = ''
@@ -79,14 +96,20 @@ if $0 == __FILE__
   begin
     GetoptLong.new(
       ['--host-name',   '-h', GetoptLong::REQUIRED_ARGUMENT],
+      ['--server',      '-s', GetoptLong::OPTIONAL_ARGUMENT],
       ['--host-binary', '-b', GetoptLong::OPTIONAL_ARGUMENT],
+      ['--timeout',     '-t', GetoptLong::OPTIONAL_ARGUMENT],
       ['--help',        '-?', GetoptLong::NO_ARGUMENT      ]
     ).each do |option, argument|
       case option
       when /^(?:--host-name|-h)$/
         host_name = argument.strip
+      when /^(?:--server|-s)$/
+        server = argument.strip
       when /^(?:--host-binary|-b)$/
         host_binary = argument.strip
+      when /^(?:--timeout|-t)$/
+        timeout = argument.to_i
       # We have -? here as -h is taken ...
       when /^(?:--help|-?)$/
         print_usage
@@ -111,62 +134,76 @@ if $0 == __FILE__
   # We will store state of parsing here ...
   seen_address = false
 
-  # We request and process results of a domain name query for a given host name ...
-  %x{ #{host_binary} -t A #{host_name} 2>&1 }.each_line do |line|
-    # Remove bloat ...
-    line.strip!
+  begin
+    Timeout.timeout(timeout) do
+      # We request and process results of a domain name query for a given host name ...
+      %x{ #{host_binary} -t A #{host_name} #{server} 2>&1 }.each_line do |line|
+        # Remove bloat ...
+        line.strip!
 
-    # Got address?  Break out ...
-    break if seen_address
+        # Got address?  Break out ...
+        break if seen_address
 
-    # Process output ...
-    if line.match(/^.+connection\stimed\sout.+no.+$/)
-      #
-      # How long is the time out here?  How long is a piece of string???
-      #
-      # As per the "../bin/dig/include/dig/dig.h" file (from BIND 9.8.x):
-      #
-      #  /*% Default TCP Timeout */
-      #  #define TCP_TIMEOUT 10
-      #  /*% Default UDP Timeout */
-      #  #define UDP_TIMEOUT 5
-      #
-      # We might have to lower this as the default time out value that
-      # NRPE has for checks is also 10 seconds ...
-      #
-      puts "WARNING: Resolution of `#{host_name}' has failed.  " +
-        "Connection timed out and no servers could be reached."
-      exit STATUS_WARNING
-    elsif line.match(/^Host\s.+\sfound:\s2\(SERVFAIL\)$/)
-      puts "CRITICAL: Resolution of `#{host_name}' has failed.  " +
-        "Authoritative name servers are not answering (code: SERVFAIL)."
-      exit STATUS_CRITIAL
-    elsif line.match(/^Host\s.+\sfound:\s3\(NXDOMAIN\)$/)
-      puts "WARNING: Resolution of `#{host_name}' has failed.  Given " +
-        "domain name does not exists or is on-hold (code: NXDOMAIN)."
-      exit STATUS_WARNING
-    elsif line.match(/^Host\s.+\sfound:\s5\(REFUSED\)$/)
-      puts "CRITICAL: Resolution of `#{host_name}' has failed.  " +
-        "No servers will not answer this client or this query " +
-        "type (code: REFUSED)."
-      exit STATUS_CRITIAL
-    elsif match = line.match(/^.+\shas\saddress\s(.+)$/)
-      #
-      # Have we seen at least one address?  We do not really care
-      # how many "A" records there are upon successful resolution ...
-      #
-      seen_address = true
+        # Add custom resolver details ...
+        server = server.empty? ? 'SYSTEM DEFAULT' : server
 
-      address = match[1].strip
-    else
-      # Skip lines that do not interest us at all ...
-      next
+        # Process output ...
+        if line.match(/^.+connection\stimed\sout.+no.+$/)
+          #
+          # How long is the time out here?  How long is a piece of string???
+          #
+          # As per the "../bin/dig/include/dig/dig.h" file (from BIND 9.8.x):
+          #
+          #  /*% Default TCP Timeout */
+          #  #define TCP_TIMEOUT 10
+          #  /*% Default UDP Timeout */
+          #  #define UDP_TIMEOUT 5
+          #
+          # We might have to lower this as the default time out value that
+          # NRPE has for checks is also 10 seconds ...
+          #
+          puts "WARNING: Resolution of `#{host_name}' has failed.  " +
+            "Connection timed out and no servers could be reached " +
+            "(resolver: #{server})."
+          exit STATUS_WARNING
+        elsif line.match(/^Host\s.+\sfound:\s2\(SERVFAIL\)$/)
+          puts "CRITICAL: Resolution of `#{host_name}' has failed.  " +
+            "Authoritative name servers are not answering (code: SERVFAIL) " +
+            "(resolver: #{server})."
+          exit STATUS_CRITIAL
+        elsif line.match(/^Host\s.+\sfound:\s3\(NXDOMAIN\)$/)
+          puts "WARNING: Resolution of `#{host_name}' has failed.  Given " +
+            "domain name does not exists or is on-hold (code: NXDOMAIN) " +
+            "(resolver: #{server})."
+          exit STATUS_WARNING
+        elsif line.match(/^Host\s.+\sfound:\s5\(REFUSED\)$/)
+          puts "CRITICAL: Resolution of `#{host_name}' has failed.  " +
+            "No servers will not answer this client or this query " +
+            "type (code: REFUSED) (resolver: #{server})."
+          exit STATUS_CRITIAL
+        elsif match = line.match(/^.+\shas\saddress\s(.+)$/)
+          #
+          # Have we seen at least one address?  We do not really care
+          # how many "A" records there are upon successful resolution ...
+          #
+          seen_address = true
+
+          address = match[1].strip
+        else
+          # Skip lines that do not interest us at all ...
+          next
+        end
+      end
     end
+  rescue Timeout::Error
+    puts "WARNING: Execution has timed out (after #{timeout} seconds)."
+    exit STATUS_WARNING
   end
 
   if seen_address and not address.empty?
     # Resolution was correct and everything is up and running ...
-    puts "OK: Resolution of `#{host_name}' was successful (IP: #{address})."
+    puts "OK: Resolution of `#{host_name}' was successful (IP: #{address}) " +
+      "(resolver: #{server})."
     exit STATUS_OK
   elsif
     #
